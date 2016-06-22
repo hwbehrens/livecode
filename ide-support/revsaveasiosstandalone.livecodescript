@@ -93,6 +93,15 @@ private command revSaveAsMobileStandaloneMain pStack, pAppBundle, pTarget
    local tSettings
    put the customProperties["cRevStandaloneSettings"] of stack pStack into tSettings
    
+   -- If we're searching for inclusions, do it here 
+   if tSettings["inclusions"] is "search" then 
+      dispatch "revSearchForInclusions" to stack "revSaveAsStandalone" with pStack, tSettings
+   end if
+   
+   -- Make sure old-style keys are retained, and updated with new information
+   -- from inclusions pane of standalone settings GUI
+   revSBConvertSettingsForPlatform tSettings, "ios"
+   
    -- Get the development root for device builds
    -- MM-2012-09-18: Rejiged the SDKs we use.  Things are now split up into sim, armv7, armv7, 
    -- since we now potentially need to use different SDKs for each.
@@ -239,8 +248,8 @@ private command revSaveAsMobileStandaloneMain pStack, pAppBundle, pTarget
       revCopyMobileNewSplash tSettings, tBaseFolder, pAppBundle
    end if
    
-   local tPlist
-   revCopyMobileFiles tFiles, tBaseFolder, pAppBundle, pTarget, tSDKs, tRedirects, tCopiedExternals, tCopiedFonts, tPlist
+   local tPlist, tCustomEntitlements
+   revCopyMobileFiles tFiles, tBaseFolder, pAppBundle, pTarget, tSDKs, tRedirects, tCopiedExternals, tCopiedFonts, tPlist, tCustomEntitlements
    revCopyMobileStackFiles tStackFiles, tBaseFolder, pAppBundle
    
    -- Copy in the appropriate externals and drivers
@@ -408,6 +417,7 @@ private command revSaveAsMobileStandaloneMain pStack, pAppBundle, pTarget
          
          -- SN-2015-02-19: [[ Bug 14625 ]] Build each binary separately according
          -- to their architecture.
+         local tArchSpecificEngineList, tArchSpecificEngineFile
          put empty into tArchSpecificEngineList
          repeat for each word tArch in tArchs
             -- Make a temporary file for link options and execute it
@@ -641,16 +651,13 @@ private command revSaveAsMobileStandaloneMain pStack, pAppBundle, pTarget
          throw "could not find a valid identity to use for the selected profile"
       end if
       
-      -- Determine what kind of profile is being used
-      if tProfileInfo["store"] then
-         put url ("binfile:" & mapFilePath(revMobileRuntimeFolder(pTarget) & slash & "StoreEntitlements.xcent")) into tEntitlements
-      else
-         put url ("binfile:" & mapFilePath(revMobileRuntimeFolder(pTarget) & slash & "Entitlements.xcent")) into tEntitlements
-      end if
+      put url ("binfile:" & mapFilePath(revMobileRuntimeFolder(pTarget) & slash & "Entitlements.xcent")) into tEntitlements
       
       -- Construct the entitlements file
+      replace "${GET_TASK_ALLOW}" with not tProfileInfo["store"] in tEntitlements
       replace "${APP_IDENTIFIER}" with tProfileInfo["appid"] in tEntitlements
       replace "${BUNDLE_IDENTIFIER}" with tSettings["ios,bundle id"] in tEntitlements
+      replace "${CUSTOM_ENTITLEMENTS}" with tCustomEntitlements in tEntitlements
       
       -- MM-2012-02-12: Added support for push notificaitons entitlements
       if tSettings["ios,push notifications"] then
@@ -892,6 +899,25 @@ end revModifyMobileImageFile
 
 ################################################################################
 
+private command addToManifest pFile, pName, pAppBundle, @xManifest, @xRedirects
+   if pName contains "//" or pName contains tab then
+      local tWarning
+      put "File/folder to include in standalone contains invalid chars (tab or //):" into tWarning
+      revStandaloneAddWarning tWarning && quote & pFile & quote
+      exit addToManifest
+   end if
+   
+   if there is a file pFile then
+      put pAppBundle & slash & pName & tab & pFile & return after xManifest
+      put pName & "//" & pFile & return after xRedirects
+   else if there is a folder pFile then
+      revCopyMobileFilesComputeFolderManifest xManifest, pFile, pAppBundle & slash & pName
+      put pName & "//" & pFile & return after xRedirects
+   else
+      revStandaloneAddWarning "File/folder to include in standalone not found:" && quote & pFile & quote
+   end if
+end addToManifest
+
 -- The files list from the standalone builder contains relative and absolute references.
 --
 -- Relative references get copied and keep their folder structure.
@@ -901,7 +927,7 @@ end revModifyMobileImageFile
 --   foobar/baz -> <base>/foobar/baz
 --   C:/foobar/baz -> <base>/baz
 --
-private command revCopyMobileFiles pFiles, pBaseFolder, pAppBundle, pAppTarget, pSDKs, @rRedirects, @rExternals, @rFonts, @rPlist
+private command revCopyMobileFiles pFiles, pBaseFolder, pAppBundle, pAppTarget, pSDKs, @rRedirects, @rExternals, @rFonts, @rPlist, @rCustomEntitlements
    revStandaloneProgress "Copying files..."
    
    -- Only use redirects in simulator 4.x
@@ -924,14 +950,28 @@ private command revCopyMobileFiles pFiles, pBaseFolder, pAppBundle, pAppTarget, 
    local tManifest
    set the itemDelimiter to slash
    repeat for each line tFile in pFiles
-      -- Added to support mergExt inclusion for iOS
-      if tFile begins with "!" then
-         local tExtPath
-         put revSBGetExternalPath("ios", char 2 to -1 of tFile) into tExtPath
-         -- if the file prefixed with ! was not a named external, treat normally
-         if tExtPath is not empty then
-            put tExtPath into tFile
+	  local tResolved
+	  put tFile into tResolved
+      revSBResolveIncludedExternal "ios", tResolved
+      
+      if tResolved is not tFile then
+         -- if this was a !-prefixed external and there is a resources 
+         -- folder, add everything in it to the top level of the app 
+         -- bundle
+         local tResources
+         put item 1 to -2 of tResolved & slash & "resources" into tResources
+         if there is a folder tResources then
+            local tContents
+            put revSBEnumerateFolder(tResources, false) into tContents
+            repeat for each line tLine in tContents
+               -- addToManifest deals with subfolders, but we need them sans slash
+               if tLine ends with "/" then
+                  put char 1 to -2 of tLine into tLine
+               end if
+               addToManifest tResources & slash & tLine, item -1 of tLine, pAppBundle, tManifest, rRedirects
+            end repeat
          end if
+         put tResolved into tFile
       end if
       
       local tIsAbsolute, tName
@@ -960,15 +1000,7 @@ private command revCopyMobileFiles pFiles, pBaseFolder, pAppBundle, pAppTarget, 
          end if
       end repeat
       
-      if there is a file tFile then
-         put pAppBundle & slash & tName & tab & tFile & return after tManifest
-         put tName & "//" & tFile & return after rRedirects
-      else if there is a folder tFile then
-         revCopyMobileFilesComputeFolderManifest tManifest, tFile, pAppBundle & slash & tName
-         put tName & "//" & tFile & return after rRedirects
-      else
-         revStandaloneAddWarning "File/folder to include in standalone not found:" && quote & tFile & quote
-      end if
+      addToManifest tFile, tName, pAppBundle, tManifest, rRedirects
    end repeat
    
    -- Remove trailing delimiter
@@ -998,6 +1030,12 @@ private command revCopyMobileFiles pFiles, pBaseFolder, pAppBundle, pAppTarget, 
       if tSource ends with ".ttf" or tSource ends with ".ttc" then
          revSBCopyFileToFile tSource, tTarget, "revStandaloneProgressCallback", the long id of me
          put "font", tTarget & return after rFonts
+         next repeat
+      end if
+      
+      -- If the file is an entitlement then handle appropriately
+      if tSource ends with ".xcent" then
+         put url ("binfile:" & tSource) after rCustomEntitlements
          next repeat
       end if
       
